@@ -1,7 +1,6 @@
 """Test that AuthError triggers fallback provider resolution (#7230)."""
 
-import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -51,6 +50,9 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
         assert result["provider"] == "openrouter"
         assert result["api_key"] == "fallback-key"
+        assert result["_fallback_used"] is True
+        assert result["_fallback_model"] == "meta-llama/llama-4-maverick"
+        assert "meta-llama/llama-4-maverick" in result["_fallback_notice"]
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 

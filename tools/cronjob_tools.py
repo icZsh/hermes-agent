@@ -240,6 +240,10 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    if job.get("depends_on"):
+        result["depends_on"] = job["depends_on"]
+        result["dependency_window_minutes"] = job.get("dependency_window_minutes")
+        result["dependency_recheck_backoff_seconds"] = job.get("dependency_recheck_backoff_seconds")
     return result
 
 
@@ -262,6 +266,12 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    depends_on: Optional[List[Any]] = None,
+    dependency_window_minutes: Optional[int] = None,
+    dependency_recheck_backoff_seconds: Optional[int] = None,
+    block_on_upstream_running: Optional[bool] = None,
+    retry_policy: Optional[Dict[str, Any]] = None,
+    priority: Optional[int] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -314,6 +324,20 @@ def cronjob(
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
+                depends_on=depends_on,
+                dependency_window_minutes=dependency_window_minutes if dependency_window_minutes is not None else 1440,
+                dependency_recheck_backoff_seconds=(
+                    dependency_recheck_backoff_seconds
+                    if dependency_recheck_backoff_seconds is not None
+                    else 300
+                ),
+                block_on_upstream_running=(
+                    block_on_upstream_running
+                    if block_on_upstream_running is not None
+                    else True
+                ),
+                retry_policy=retry_policy,
+                priority=priority if priority is not None else 100,
             )
             return json.dumps(
                 {
@@ -336,6 +360,11 @@ def cronjob(
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
+        if normalized == "dag_status":
+            from cron.dag_observer import dag_status
+
+            return json.dumps(dag_status(), indent=2)
+
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
@@ -345,6 +374,11 @@ def cronjob(
                 {"success": False, "error": f"Job with ID '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
                 indent=2,
             )
+
+        if normalized == "dag_explain":
+            from cron.dag_observer import dag_explain
+
+            return json.dumps(dag_explain(job_id), indent=2)
 
         if normalized == "remove":
             removed = remove_job(job_id)
@@ -427,6 +461,18 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if depends_on is not None:
+                updates["depends_on"] = depends_on
+            if dependency_window_minutes is not None:
+                updates["dependency_window_minutes"] = dependency_window_minutes
+            if dependency_recheck_backoff_seconds is not None:
+                updates["dependency_recheck_backoff_seconds"] = dependency_recheck_backoff_seconds
+            if block_on_upstream_running is not None:
+                updates["block_on_upstream_running"] = block_on_upstream_running
+            if retry_policy is not None:
+                updates["retry_policy"] = retry_policy
+            if priority is not None:
+                updates["priority"] = priority
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -476,11 +522,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run"
+                "description": "One of: create, list, update, pause, resume, remove, run, dag_status, dag_explain"
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run"
+                "description": "Required for update/pause/resume/remove/run/dag_explain"
             },
             "prompt": {
                 "type": "string",
@@ -548,6 +594,30 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "depends_on": {
+                "type": "array",
+                "description": "Optional DAG dependencies. Entries may be upstream job IDs or objects with job_id, severity, policy, and readiness."
+            },
+            "dependency_window_minutes": {
+                "type": "integer",
+                "description": "Dependency recheck window before a hard block becomes terminal."
+            },
+            "dependency_recheck_backoff_seconds": {
+                "type": "integer",
+                "description": "Seconds between dependency rechecks while blocked."
+            },
+            "block_on_upstream_running": {
+                "type": "boolean",
+                "description": "Whether an upstream due in the same scheduler tick blocks this job for recheck."
+            },
+            "retry_policy": {
+                "type": "object",
+                "description": "Agent execution retry settings, e.g. {\"max_retries\": 1, \"backoff_seconds\": 300}."
+            },
+            "priority": {
+                "type": "integer",
+                "description": "Scheduler priority for DAG jobs; lower numbers sort first."
+            },
         },
         "required": ["action"]
     }
@@ -595,6 +665,12 @@ registry.register(
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
+        depends_on=args.get("depends_on"),
+        dependency_window_minutes=args.get("dependency_window_minutes"),
+        dependency_recheck_backoff_seconds=args.get("dependency_recheck_backoff_seconds"),
+        block_on_upstream_running=args.get("block_on_upstream_running"),
+        retry_policy=args.get("retry_policy"),
+        priority=args.get("priority"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

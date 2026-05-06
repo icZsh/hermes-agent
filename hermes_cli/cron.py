@@ -160,6 +160,56 @@ def cron_status():
     print()
 
 
+def cron_dag_status():
+    """Show DAG node status from the run ledger."""
+    from cron.dag_observer import dag_status
+
+    result = dag_status()
+    if not result.get("success"):
+        print(color(f"DAG status unavailable: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    nodes = result.get("nodes", [])
+    if not nodes:
+        print(color("No cron DAG jobs.", Colors.DIM))
+        return 0
+    print()
+    print(color("Cron DAG Status", Colors.CYAN))
+    for node in nodes:
+        deps = ", ".join(node.get("depends_on") or []) or "-"
+        print(f"  {color(node['job_id'], Colors.YELLOW)} {node.get('state')}: {node.get('name')}")
+        print(f"    depends_on: {deps}")
+        if node.get("last_reason_code"):
+            print(f"    reason:     {node['last_reason_code']}")
+        if node.get("dependency_recheck_at"):
+            print(f"    recheck_at: {node['dependency_recheck_at']}")
+    print()
+    return 0
+
+
+def cron_dag_explain(job_id: str):
+    """Explain why a DAG job is blocked."""
+    from cron.dag_observer import dag_explain
+
+    result = dag_explain(job_id)
+    if not result.get("success"):
+        print(color(f"DAG explain failed: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    print()
+    print(color(f"DAG Explain: {job_id}", Colors.CYAN))
+    print(f"  Path: {' -> '.join(result.get('path') or [])}")
+    for node_id, snapshot in (result.get("snapshots") or {}).items():
+        latest = snapshot.get("latest") or {}
+        job = snapshot.get("job") or {}
+        print(f"  {color(node_id, Colors.YELLOW)} {job.get('name') or ''}")
+        print(f"    status: {latest.get('status')}")
+        if latest.get("reason_code"):
+            print(f"    reason: {latest.get('reason_code')}")
+        if latest.get("reason_detail"):
+            print(f"    detail: {latest.get('reason_detail')}")
+    print()
+    return 0
+
+
 def cron_create(args):
     result = _cron_api(
         action="create",
@@ -271,6 +321,15 @@ def cron_command(args):
     if subcmd == "status":
         cron_status()
         return 0
+
+    if subcmd == "dag":
+        dag_command = getattr(args, "dag_command", None)
+        if dag_command in (None, "status"):
+            return cron_dag_status()
+        if dag_command == "explain":
+            return cron_dag_explain(args.job_id)
+        print(f"Unknown cron dag command: {dag_command}")
+        return 1
 
     if subcmd == "tick":
         cron_tick()

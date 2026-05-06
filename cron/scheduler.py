@@ -16,6 +16,7 @@ import logging
 import os
 import subprocess
 import sys
+import uuid
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -37,6 +38,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli.config import load_config
 from hermes_time import now as _hermes_now
+from cron.dependency_gate import GateResult, evaluate_dependencies
+from cron.jobs import get_due_jobs, get_job, mark_job_run, save_job_output, advance_next_run
+from cron.run_ledger import RunLedger, RunLedgerUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +111,6 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
-
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
 # locally for audit.
@@ -120,6 +122,8 @@ _hermes_home = get_hermes_home()
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+_SCHEDULER_INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+_LEDGER_RECONCILED = False
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -967,6 +971,12 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
         # Provider routing
         pr = _cfg.get("provider_routing", {})
+        fallback_notice = None
+        cron_status_messages = []
+
+        def _cron_status_callback(event_type: str, message: str) -> None:
+            if message and "fallback" in str(message).lower():
+                cron_status_messages.append(str(message))
 
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
@@ -996,7 +1006,21 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     if entry.get("api_key"):
                         fb_kwargs["explicit_api_key"] = entry["api_key"]
                     runtime = resolve_runtime_provider(**fb_kwargs)
-                    logger.info("Job '%s': fallback resolved to %s", job_id, runtime.get("provider"))
+                    fb_model = (entry.get("model") or "").strip()
+                    fb_provider = runtime.get("provider") or entry.get("provider")
+                    if fb_model:
+                        model = fb_model
+                    fallback_notice = (
+                        "⚠️ Cron provider fallback used: primary auth failed; "
+                        f"switched to `{model}` via `{fb_provider}` "
+                        f"for job `{job_name}`."
+                    )
+                    logger.info(
+                        "Job '%s': fallback resolved to %s model=%s",
+                        job_id,
+                        fb_provider,
+                        model or "(default)",
+                    )
                     break
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, entry.get("provider"), fb_exc)
@@ -1054,6 +1078,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            status_callback=_cron_status_callback,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -1166,6 +1191,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
+        fallback_messages = []
+        if fallback_notice:
+            fallback_messages.append(fallback_notice)
+        for _msg in cron_status_messages:
+            if _msg not in fallback_messages:
+                fallback_messages.append(_msg)
+        if fallback_messages:
+            fallback_block = "\n".join(fallback_messages)
+            if not final_response.strip() or final_response.strip() == "[SILENT]":
+                final_response = fallback_block
+            else:
+                final_response = fallback_block + "\n\n" + final_response
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -1255,6 +1292,85 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+class _UnavailableLedger:
+    def __init__(self, reason: str):
+        self.reason = reason
+
+    def get_latest_terminal(self, job_id: str):
+        raise RunLedgerUnavailable(self.reason)
+
+
+def _open_run_ledger() -> RunLedger | _UnavailableLedger:
+    global _LEDGER_RECONCILED
+    try:
+        ledger = RunLedger()
+        if not _LEDGER_RECONCILED:
+            reconciled = ledger.reconcile_orphans(_SCHEDULER_INSTANCE_ID)
+            if reconciled:
+                logger.warning("Reconciled %d orphaned cron run(s)", reconciled)
+            ledger.cleanup_retention()
+            _LEDGER_RECONCILED = True
+        return ledger
+    except RunLedgerUnavailable as exc:
+        logger.error("Cron run ledger unavailable: %s", exc)
+        return _UnavailableLedger(str(exc))
+
+
+def _ledger_can_write(ledger) -> bool:
+    return isinstance(ledger, RunLedger)
+
+
+def _job_has_dependencies(job: dict) -> bool:
+    return bool(job.get("depends_on"))
+
+
+def _build_blocked_output(job: dict, gate_result: GateResult) -> str:
+    lines = [
+        f"# Cron job blocked: {job.get('name') or job.get('id')}",
+        "",
+        f"- downstream_job_id: {job.get('id')}",
+        f"- reason_code: {gate_result.reason_code}",
+        f"- reason_detail: {gate_result.reason_detail or ''}",
+    ]
+    if gate_result.dependency_recheck_at:
+        lines.append(f"- next_recheck_at: {gate_result.dependency_recheck_at.isoformat()}")
+    snapshot = gate_result.upstream_snapshot or {}
+    for upstream_id, details in snapshot.items():
+        lines.extend([
+            "",
+            f"## Upstream {upstream_id}",
+            f"- ready: {details.get('ready')}",
+            f"- severity: {details.get('severity')}",
+            f"- reason_code: {details.get('reason_code')}",
+            f"- reason_detail: {details.get('reason_detail')}",
+        ])
+        artifact = details.get("artifact") or {}
+        if artifact.get("path") or artifact.get("pattern"):
+            lines.append(f"- expected_artifact: {artifact.get('path') or artifact.get('pattern')}")
+            lines.append(f"- artifact_exists: {artifact.get('exists')}")
+    return "\n".join(lines) + "\n"
+
+
+def _record_gate_result(ledger, job: dict, gate_result: GateResult, *, output_file=None) -> None:
+    if not _ledger_can_write(ledger):
+        return
+    try:
+        ledger.record_gate_blocked(
+            job_id=job["id"],
+            scheduled_for=job.get("_dag_scheduled_for") or job.get("scheduled_for") or job.get("next_run_at"),
+            trigger_type=job.get("_dag_trigger_type", "schedule"),
+            parent_run_id=job.get("_dag_parent_run_id"),
+            reason_code=gate_result.reason_code or "gate_evaluation_error",
+            reason_detail=gate_result.reason_detail,
+            upstream_snapshot=gate_result.upstream_snapshot,
+            dependency_recheck_at=gate_result.dependency_recheck_at,
+            output_file=output_file,
+            scheduler_instance_id=_SCHEDULER_INSTANCE_ID,
+        )
+    except RunLedgerUnavailable as exc:
+        logger.error("Failed to record cron gate decision for %s: %s", job.get("id"), exc)
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -1286,20 +1402,86 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             lock_fd.close()
         return 0
 
+    ledger = _open_run_ledger()
     try:
-        due_jobs = get_due_jobs()
+        try:
+            now = _hermes_now()
+            due_jobs = get_due_jobs()
+            pending_rechecks = ledger.get_pending_rechecks(now) if _ledger_can_write(ledger) else []
+            due_job_ids = {job.get("id") for job in due_jobs}
 
-        if verbose and not due_jobs:
+            candidates = []
+            candidate_job_ids = set()
+            for job in due_jobs:
+                if _ledger_can_write(ledger) and _job_has_dependencies(job):
+                    future_recheck = ledger.get_future_recheck(job["id"], now)
+                    if future_recheck:
+                        logger.info(
+                            "Job '%s' remains dependency-blocked until %s",
+                            job["id"],
+                            future_recheck.get("dependency_recheck_at"),
+                        )
+                        continue
+                candidate = dict(job)
+                candidate["_dag_trigger_type"] = "schedule"
+                candidate["_dag_scheduled_for"] = candidate.get("next_run_at")
+                candidates.append(candidate)
+                candidate_job_ids.add(candidate.get("id"))
+
+            for row in pending_rechecks:
+                job_id = row.get("job_id")
+                if job_id in due_job_ids or job_id in candidate_job_ids:
+                    continue
+                job = get_job(job_id)
+                if not job or not job.get("enabled", True):
+                    continue
+                candidate = dict(job)
+                candidate["_dag_trigger_type"] = "dependency_recheck"
+                candidate["_dag_parent_run_id"] = row.get("run_id")
+                candidate["_dag_scheduled_for"] = row.get("scheduled_for") or candidate.get("next_run_at")
+                candidates.append(candidate)
+                candidate_job_ids.add(job_id)
+        except RunLedgerUnavailable as exc:
+            logger.error("Cron run ledger unavailable while loading rechecks: %s", exc)
+            due_jobs = get_due_jobs()
+            candidates = [dict(job, _dag_trigger_type="schedule", _dag_scheduled_for=job.get("next_run_at")) for job in due_jobs]
+
+        if verbose and not candidates:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
 
         if verbose:
-            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
+            logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(candidates))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        for job in due_jobs:
-            advance_next_run(job["id"])
+        current_tick_due_set = {job["id"] for job in candidates}
+        ready_jobs = []
+        for job in candidates:
+            gate_result = evaluate_dependencies(job, ledger, current_tick_due_set, now)
+            job["_dag_gate_result"] = gate_result
+
+            if gate_result.status in {"ready", "ready_degraded"}:
+                advance_next_run(job["id"])
+                ready_jobs.append(job)
+                continue
+
+            if gate_result.status == "blocked_terminal":
+                advance_next_run(job["id"])
+                blocked_output = _build_blocked_output(job, gate_result)
+                output_file = None
+                delivery_error = None
+                try:
+                    output_file = save_job_output(job["id"], blocked_output)
+                    delivery_error = _deliver_result(job, blocked_output, adapters=adapters, loop=loop)
+                except Exception as exc:
+                    delivery_error = str(exc)
+                    logger.error("Delivery failed for blocked job %s: %s", job["id"], exc)
+                mark_job_run(job["id"], False, gate_result.reason_detail, delivery_error=delivery_error)
+                _record_gate_result(ledger, job, gate_result, output_file=output_file)
+                continue
+
+            _record_gate_result(ledger, job, gate_result)
+
+        due_jobs = ready_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -1330,6 +1512,22 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            gate_result = job.get("_dag_gate_result")
+            run_id = None
+            if _ledger_can_write(ledger):
+                try:
+                    run_id = ledger.record_run_start(
+                        job_id=job["id"],
+                        scheduled_for=job.get("_dag_scheduled_for") or job.get("next_run_at"),
+                        trigger_type=job.get("_dag_trigger_type", "schedule"),
+                        parent_run_id=job.get("_dag_parent_run_id"),
+                        reason_code=gate_result.reason_code if gate_result and gate_result.status == "ready_degraded" else None,
+                        reason_detail=gate_result.reason_detail if gate_result and gate_result.status == "ready_degraded" else None,
+                        upstream_snapshot=gate_result.upstream_snapshot if gate_result else None,
+                        scheduler_instance_id=_SCHEDULER_INSTANCE_ID,
+                    )
+                except RunLedgerUnavailable as exc:
+                    logger.error("Failed to record cron run start for %s: %s", job.get("id"), exc)
             try:
                 success, output, final_response, error = run_job(job)
 
@@ -1362,11 +1560,32 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                if run_id and _ledger_can_write(ledger):
+                    try:
+                        ledger.record_run_finish(
+                            run_id,
+                            status="success" if success else "failed",
+                            reason_code=None if success else "agent_execution_failed",
+                            reason_detail=error,
+                            output_file=output_file,
+                        )
+                    except RunLedgerUnavailable as exc:
+                        logger.error("Failed to record cron run finish for %s: %s", job.get("id"), exc)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
                 mark_job_run(job["id"], False, str(e))
+                if run_id and _ledger_can_write(ledger):
+                    try:
+                        ledger.record_run_finish(
+                            run_id,
+                            status="failed",
+                            reason_code="agent_execution_failed",
+                            reason_detail=str(e),
+                        )
+                    except RunLedgerUnavailable as exc:
+                        logger.error("Failed to record cron run failure for %s: %s", job.get("id"), exc)
                 return False
 
         # Partition due jobs: those with a per-job workdir mutate
@@ -1405,6 +1624,8 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         return sum(_results)
     finally:
+        if _ledger_can_write(ledger):
+            ledger.close()
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         elif msvcrt:

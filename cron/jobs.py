@@ -15,13 +15,19 @@ import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Union
 
-logger = logging.getLogger(__name__)
-
+from cron.dependency_spec import (
+    DEPENDENCY_FIELD_NAMES,
+    normalize_job_dependency_fields,
+    normalize_jobs_for_access,
+    validate_no_dependency_cycles,
+)
+from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 from utils import atomic_replace
+
+logger = logging.getLogger(__name__)
 
 try:
     from croniter import croniter
@@ -69,6 +75,17 @@ def _apply_skill_fields(job: Dict[str, Any]) -> Dict[str, Any]:
     normalized["skills"] = skills
     normalized["skill"] = skills[0] if skills else None
     return normalized
+
+
+def _normalize_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a job dict with lazy schema defaults applied for accessors."""
+    return normalize_job_dependency_fields(_apply_skill_fields(job))
+
+
+def _normalize_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize jobs for runtime access, including v1 dependency compat edges."""
+    skill_normalized = [_apply_skill_fields(job) for job in jobs]
+    return [normalize_job_dependency_fields(job) for job in normalize_jobs_for_access(skill_normalized)]
 
 
 def _secure_dir(path: Path):
@@ -435,6 +452,12 @@ def create_job(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
+    depends_on: Optional[List[Any]] = None,
+    dependency_window_minutes: int = 1440,
+    dependency_recheck_backoff_seconds: int = 300,
+    block_on_upstream_running: bool = True,
+    retry_policy: Optional[Dict[str, Any]] = None,
+    priority: int = 100,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -466,6 +489,13 @@ def create_job(
                 terminal/file/code_exec tools use it as their working directory
                 (via TERMINAL_CWD).  When unset, the old behaviour is preserved
                 (no context files injected, tools use the scheduler's cwd).
+        depends_on: Optional dependency edges.  Strings are shorthand for
+                    all_success hard job_success dependencies.
+        dependency_window_minutes: Total dependency recheck window.
+        dependency_recheck_backoff_seconds: Delay between dependency rechecks.
+        block_on_upstream_running: Whether running upstreams block this job.
+        retry_policy: Agent execution retry settings.
+        priority: Scheduler priority for due DAG jobs.
 
     Returns:
         The created job dict
@@ -541,9 +571,17 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "depends_on": depends_on or [],
+        "dependency_window_minutes": dependency_window_minutes,
+        "dependency_recheck_backoff_seconds": dependency_recheck_backoff_seconds,
+        "block_on_upstream_running": block_on_upstream_running,
+        "retry_policy": retry_policy or {"max_retries": 0, "backoff_seconds": 0},
+        "priority": priority,
     }
+    job = normalize_job_dependency_fields(job)
 
     jobs = load_jobs()
+    validate_no_dependency_cycles([*jobs, job])
     jobs.append(job)
     save_jobs(jobs)
 
@@ -552,16 +590,16 @@ def create_job(
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get a job by ID."""
-    jobs = load_jobs()
+    jobs = _normalize_jobs(load_jobs())
     for job in jobs:
         if job["id"] == job_id:
-            return _apply_skill_fields(job)
+            return job
     return None
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     """List all jobs, optionally including disabled ones."""
-    jobs = [_apply_skill_fields(j) for j in load_jobs()]
+    jobs = _normalize_jobs(load_jobs())
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     return jobs
@@ -569,6 +607,7 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    updates = dict(updates)
     jobs = load_jobs()
     for i, job in enumerate(jobs):
         if job["id"] != job_id:
@@ -609,9 +648,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
 
+        if DEPENDENCY_FIELD_NAMES & (set(updates) | set(job)):
+            updated = normalize_job_dependency_fields(updated)
+            jobs_for_validation = [
+                updated if candidate.get("id") == job_id else candidate
+                for candidate in jobs
+            ]
+            validate_no_dependency_cycles(jobs_for_validation)
+
         jobs[i] = updated
         save_jobs(jobs)
-        return _apply_skill_fields(jobs[i])
+        return _normalize_job(jobs[i])
     return None
 
 
@@ -787,7 +834,7 @@ def get_due_jobs() -> List[Dict[str, Any]]:
     """
     now = _hermes_now()
     raw_jobs = load_jobs()
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    jobs = _normalize_jobs(copy.deepcopy(raw_jobs))
     due = []
     needs_save = False
 

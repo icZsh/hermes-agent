@@ -543,7 +543,13 @@ def _try_resolve_fallback_provider() -> dict | None:
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=entry.get("api_key"),
                 )
-                logger.info("Fallback provider resolved: %s", runtime.get("provider"))
+                fb_model = (entry.get("model") or "").strip()
+                fb_provider = runtime.get("provider") or entry.get("provider")
+                logger.info(
+                    "Fallback provider resolved: %s model=%s",
+                    fb_provider,
+                    fb_model or "(default)",
+                )
                 return {
                     "api_key": runtime.get("api_key"),
                     "base_url": runtime.get("base_url"),
@@ -552,6 +558,19 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
+                    # Private metadata consumed by gateway routing before the
+                    # kwargs are passed to AIAgent.  Critical: auth-time
+                    # fallback must switch both provider AND model; otherwise
+                    # a fallback provider may receive the primary model slug.
+                    "_fallback_used": True,
+                    "_fallback_model": fb_model,
+                    "_fallback_notice": (
+                        "⚠️ Provider fallback used: primary auth failed; "
+                        f"switched to `{fb_model}` via `{fb_provider}`."
+                    ) if fb_model else (
+                        "⚠️ Provider fallback used: primary auth failed; "
+                        f"switched to `{fb_provider}`."
+                    ),
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -1305,6 +1324,8 @@ class GatewayRunner:
             )
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
+        if runtime_kwargs.get("_fallback_used") and runtime_kwargs.get("_fallback_model"):
+            model = runtime_kwargs["_fallback_model"]
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -1350,6 +1371,8 @@ class GatewayRunner:
         route = {
             "model": model,
             "runtime": runtime,
+            "fallback_used": bool(runtime_kwargs.get("_fallback_used")),
+            "fallback_notice": runtime_kwargs.get("_fallback_notice"),
             "signature": (
                 model,
                 runtime["provider"],
@@ -7488,6 +7511,12 @@ class GatewayRunner:
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            if turn_route.get("fallback_notice"):
+                await adapter.send(
+                    source.chat_id,
+                    turn_route["fallback_notice"],
+                    metadata=_thread_metadata,
+                )
 
             def run_sync():
                 agent = AIAgent(
@@ -11228,6 +11257,8 @@ class GatewayRunner:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            if turn_route.get("fallback_notice"):
+                _status_callback_sync("provider_fallback", turn_route["fallback_notice"])
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool

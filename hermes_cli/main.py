@@ -8570,6 +8570,13 @@ def main():
     # cron status
     cron_subparsers.add_parser("status", help="Check if cron scheduler is running")
 
+    # cron dag status/explain
+    cron_dag = cron_subparsers.add_parser("dag", help="Inspect cron DAG dependencies")
+    cron_dag_subparsers = cron_dag.add_subparsers(dest="dag_command")
+    cron_dag_subparsers.add_parser("status", help="Show DAG node status")
+    cron_dag_explain = cron_dag_subparsers.add_parser("explain", help="Explain why a DAG job is blocked")
+    cron_dag_explain.add_argument("job_id", help="Job ID to explain")
+
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     _add_accept_hooks_flag(cron_tick)

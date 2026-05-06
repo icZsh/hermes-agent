@@ -105,3 +105,46 @@ class TestCronCommandLifecycle:
         assert len(jobs) == 1
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
+
+    def test_dag_status_command(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "cron.dag_observer.dag_status",
+            lambda: {
+                "success": True,
+                "nodes": [{
+                    "job_id": "job-a",
+                    "name": "Job A",
+                    "state": "ready",
+                    "depends_on": [],
+                }],
+            },
+        )
+
+        result = cron_command(Namespace(cron_command="dag", dag_command="status"))
+
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "Cron DAG Status" in out
+        assert "job-a" in out
+
+    def test_dag_explain_command(self, tmp_cron_dir, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "cron.dag_observer.dag_explain",
+            lambda job_id: {
+                "success": True,
+                "path": [job_id, "upstream"],
+                "snapshots": {
+                    job_id: {
+                        "job": {"name": "Down"},
+                        "latest": {"status": "blocked", "reason_code": "upstream_failed"},
+                    }
+                },
+            },
+        )
+
+        result = cron_command(Namespace(cron_command="dag", dag_command="explain", job_id="down"))
+
+        out = capsys.readouterr().out
+        assert result == 0
+        assert "DAG Explain" in out
+        assert "down -> upstream" in out
